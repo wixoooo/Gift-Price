@@ -9,11 +9,26 @@ from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler
 from markets.client_manager import client_manager
 from utils.logger_setup import setup_logging
 from utils.converter import get_rates
-from utils.config import BOT_TOKEN, TONNEL_URL, PORTALS_URL, MRKT_URL, CHANNEL_NAME, CHANNEL_URL
+from utils.config import (
+    BOT_TOKEN,
+    TONNEL_URL,
+    PORTALS_URL,
+    MRKT_URL,
+    CHANNEL_NAME,
+    CHANNEL_URL,
+)
 from utils.session_manager import session_manager
-from core.gift_parser import parse_gift_page, format_gift_details
-from core.message_formatter import format_market_output
+from core.gift_parser import parse_gift_page
 from core.market_aggregator import fetch_all_market_prices
+
+from utils.changes_api import get_changes_emojis, get_backdrop_emoji_id
+from core.message_formatter import (
+    format_message_like_screenshot,
+    build_market_sections,
+    EMOJI_TONNEL,
+    EMOJI_PORTALS,
+    EMOJI_MRKT,
+)
 
 setup_logging()
 log = logging.getLogger(__name__)
@@ -33,14 +48,14 @@ async def fetch_gift_data(link: str) -> tuple[Optional[str], Optional[dict]]:
     session = await session_manager.get_session()
     link_task = session.get(link, timeout=15)
     rates_task = get_rates()
-    
+
     try:
         link_resp, rates_data = await asyncio.gather(link_task, rates_task)
-        
+
         if not link_resp.ok:
             log.warning("Failed to fetch gift link %s. Status: %d", link, link_resp.status)
             return None, None
-            
+
         html = link_resp.text
         return html, rates_data
     except Exception as e:
@@ -53,46 +68,84 @@ def build_price_message(
     gift_details: dict,
     market_prices: dict,
     ton_to_usd_rate: Optional[float],
-    usdt_to_irr_rate: Optional[float]
+    usdt_to_irr_rate: Optional[float],
+    *,
+    collection_emoji_id: Optional[str],
+    model_emoji_id: Optional[str],
+    backdrop_emoji_id: Optional[str],
+    symbol_emoji_id: Optional[str],
 ) -> str:
-    output = format_gift_details(gift_details, link)
+    sections = []
 
-    output += format_market_output(
+    # Tonnel
+    sections += build_market_sections(
         market_name="Tonnel",
         market_url=TONNEL_URL,
+        market_emoji=EMOJI_TONNEL,
         price_simple=market_prices["tonnel"].price_simple,
         error_simple=market_prices["tonnel"].error_simple,
         price_detailed=market_prices["tonnel"].price_detailed,
         error_detailed=market_prices["tonnel"].error_detailed,
+        model_name=gift_details.get("model_name"),
+        backdrop_name=gift_details.get("backdrop_name"),
         ton_to_usd_rate=ton_to_usd_rate,
         usdt_to_irr_rate=usdt_to_irr_rate,
-        adjustment_factor=TONNEL_PRICE_ADJUSTMENT
+        adjustment_factor=TONNEL_PRICE_ADJUSTMENT,
+        is_nano_ton=False,
     )
 
-    output += format_market_output(
+    # Portals
+    sections += build_market_sections(
         market_name="Portals",
         market_url=PORTALS_URL,
+        market_emoji=EMOJI_PORTALS,
         price_simple=market_prices["portals"].price_simple,
         error_simple=market_prices["portals"].error_simple,
         price_detailed=market_prices["portals"].price_detailed,
         error_detailed=market_prices["portals"].error_detailed,
+        model_name=gift_details.get("model_name"),
+        backdrop_name=gift_details.get("backdrop_name"),
         ton_to_usd_rate=ton_to_usd_rate,
-        usdt_to_irr_rate=usdt_to_irr_rate
+        usdt_to_irr_rate=usdt_to_irr_rate,
+        adjustment_factor=1.0,
+        is_nano_ton=False,
     )
 
-    output += format_market_output(
+    # MRKT (nanoTON -> TON)
+    sections += build_market_sections(
         market_name="MRKT",
         market_url=MRKT_URL,
+        market_emoji=EMOJI_MRKT,
         price_simple=market_prices["mrkt"].price_simple,
         error_simple=market_prices["mrkt"].error_simple,
         price_detailed=market_prices["mrkt"].price_detailed,
         error_detailed=market_prices["mrkt"].error_detailed,
+        model_name=gift_details.get("model_name"),
+        backdrop_name=gift_details.get("backdrop_name"),
         ton_to_usd_rate=ton_to_usd_rate,
         usdt_to_irr_rate=usdt_to_irr_rate,
-        is_nano_ton=True
+        adjustment_factor=1.0,
+        is_nano_ton=True,
     )
 
-    return output
+    # gift_details["title"] is like "Bow Tie #17830"
+    gift_title = gift_details.get("title") or "Gift"
+
+    return format_message_like_screenshot(
+        gift_title=gift_title,
+        gift_link=link,
+        collection_emoji_id=collection_emoji_id,
+        model_emoji_id=model_emoji_id,
+        backdrop_emoji_id=backdrop_emoji_id,
+        symbol_emoji_id=symbol_emoji_id,
+        model_name=gift_details.get("model_name"),
+        model_percent=gift_details.get("model_percent"),
+        backdrop_name=gift_details.get("backdrop_name"),
+        backdrop_percent=gift_details.get("backdrop_percent"),
+        symbol_name=gift_details.get("symbol_name"),
+        symbol_percent=gift_details.get("symbol_percent"),
+        sections=sections,
+    )
 
 
 async def process_gift_link(link: str, message, bot_username: str) -> None:
@@ -102,7 +155,7 @@ async def process_gift_link(link: str, message, bot_username: str) -> None:
 
     try:
         html, rates_data = await fetch_gift_data(link)
-        
+
         if html is None:
             await message.reply_text("Could not fetch the gift link. It might be invalid or expired.")
             return
@@ -116,27 +169,49 @@ async def process_gift_link(link: str, message, bot_username: str) -> None:
         if not gift_details.get("model_name"):
             log.info("No model details found for link %s. Assuming it's an invalid gift.", link)
             await message.reply_text(
-                f'Gift not found! The link may be incorrect or expired:\n{link}',
+                f"Gift not found! The link may be incorrect or expired:\n{link}",
                 parse_mode="HTML",
-                disable_web_page_preview=True
+                disable_web_page_preview=True,
             )
             return
 
         market_prices = await fetch_all_market_prices(gift_details)
-        
+
+        # ---------- Resolve premium emojis ----------
+        collection_name = gift_details.get("gift_name_clean") or ""
+        changes = await get_changes_emojis(collection_name) if collection_name else {}
+
+        collection_emoji_id = changes.get("collection_emoji_id")
+
+        model_key = (gift_details.get("model_name") or "").strip().lower()
+        symbol_key = (gift_details.get("symbol_name") or "").strip().lower()
+
+        model_emoji_id = (changes.get("model_emoji") or {}).get(model_key)
+        symbol_emoji_id = (changes.get("symbol_emoji") or {}).get(symbol_key)
+
+        # Backdrop MUST come from your override list
+        backdrop_emoji_id = get_backdrop_emoji_id(gift_details.get("backdrop_name"))
+
         output = build_price_message(
-            link, gift_details, market_prices,
-            rates_data["ton_to_usd"], rates_data["usdt_to_irr"]
+            link,
+            gift_details,
+            market_prices,
+            rates_data["ton_to_usd"],
+            rates_data["usdt_to_irr"],
+            collection_emoji_id=collection_emoji_id,
+            model_emoji_id=model_emoji_id,
+            backdrop_emoji_id=backdrop_emoji_id,
+            symbol_emoji_id=symbol_emoji_id,
         )
-        
+
         reply_markup = create_reply_markup(bot_username)
         await message.reply_text(
             output,
             parse_mode="HTML",
             disable_web_page_preview=True,
-            reply_markup=reply_markup
+            reply_markup=reply_markup,
         )
-        
+
     except Exception as e:
         log.error("Error in process_gift_link: %s", e, exc_info=True)
         await message.reply_text("An unexpected error occurred while processing the gift link.")
@@ -169,20 +244,22 @@ async def price_command_handler(update: Update, context: ContextTypes.DEFAULT_TY
             "   <code>/p https://t.me/nft/...</code>\n\n"
             "2. Or, reply to a message that contains a link with just the command:\n"
             "   <code>/p</code>",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
 
 
 async def send_welcome_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    welcome_text = """Hello! 👋🏻
-With this bot, you can send Telegram gift links to get their prices across all three markets (Portals, Tonnel, MRKT). Just send the gift link, and the bot will display the prices.
-"""
+    welcome_text = (
+        "Hello!\n"
+        "With this bot, you can send Telegram gift links to get their prices across all three markets "
+        "(Portals, Tonnel, MRKT). Just send the gift link, and the bot will display the prices.\n"
+    )
 
     reply_markup = create_reply_markup(context.bot.username)
     await update.message.reply_text(
         welcome_text,
         parse_mode="HTML",
-        reply_markup=reply_markup
+        reply_markup=reply_markup,
     )
 
 
