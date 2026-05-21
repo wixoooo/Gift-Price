@@ -2,9 +2,10 @@ from typing import Optional
 import asyncio
 import re
 import logging
+import time
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
 from markets.client_manager import client_manager
 from utils.logger_setup import setup_logging
@@ -34,13 +35,15 @@ setup_logging()
 log = logging.getLogger(__name__)
 
 TONNEL_PRICE_ADJUSTMENT = 1.06
+# دیکشنری برای نگهداری زمان آخرین درخواست هر کاربر
+user_cooldowns = {}
 
 
 def create_reply_markup(bot_username: str) -> InlineKeyboardMarkup:
-    keyboard = []
-    if CHANNEL_URL and (CHANNEL_URL.startswith("http://") or CHANNEL_URL.startswith("https://")):
-        keyboard.append([InlineKeyboardButton(CHANNEL_NAME, url=CHANNEL_URL)])
-    keyboard.append([InlineKeyboardButton("Add to group", url=f"https://t.me/{bot_username}?startgroup=new")])
+    # فقط دکمه Add to group نگه‌داشته شد
+    keyboard = [
+        [InlineKeyboardButton("Add to group", url=f"https://t.me/{bot_username}?startgroup=new")]
+    ]
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -128,7 +131,6 @@ def build_price_message(
         is_nano_ton=True,
     )
 
-    # gift_details["title"] is like "Bow Tie #17830"
     gift_title = gift_details.get("title") or "Gift"
 
     return format_message_like_screenshot(
@@ -177,7 +179,6 @@ async def process_gift_link(link: str, message, bot_username: str) -> None:
 
         market_prices = await fetch_all_market_prices(gift_details)
 
-        # ---------- Resolve premium emojis ----------
         collection_name = gift_details.get("gift_name_clean") or ""
         changes = await get_changes_emojis(collection_name) if collection_name else {}
 
@@ -189,7 +190,6 @@ async def process_gift_link(link: str, message, bot_username: str) -> None:
         model_emoji_id = (changes.get("model_emoji") or {}).get(model_key)
         symbol_emoji_id = (changes.get("symbol_emoji") or {}).get(symbol_key)
 
-        # Backdrop MUST come from your override list
         backdrop_emoji_id = get_backdrop_emoji_id(gift_details.get("backdrop_name"))
 
         output = build_price_message(
@@ -224,28 +224,36 @@ def extract_gift_link(text: str) -> Optional[str]:
 
 async def price_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
+    text = (message.text or "").strip().lower()
+    
     text_to_search = ""
-
-    if context.args:
-        text_to_search = " ".join(context.args)
-    elif message.reply_to_message and message.reply_to_message.text:
+    # اگر کلمه دقیقاً p بود و روی یک پیام ریپلای شده بود
+    if text == "p" and message.reply_to_message and message.reply_to_message.text:
         text_to_search = message.reply_to_message.text
+    # در صورتی که در متن علامت + بود (مثلا + در کنار لینک NFT)
+    elif "+" in text:
+        text_to_search = message.text
+    else:
+        text_to_search = message.text
 
-    link = extract_gift_link(text_to_search) if text_to_search else None
+    link = extract_gift_link(text_to_search)
 
     if link:
+        user_id = update.effective_user.id
+        current_time = time.time()
+        
+        # بررسی محدودیت ۳۰ ثانیه استفاده برای هر کاربر
+        if user_id in user_cooldowns and current_time - user_cooldowns[user_id] < 30:
+            await message.reply_text(
+                '<tg-emoji emoji-id="5440660757194744323">‼️</tg-emoji> <b>محدودیت استفاده هر 30 ثانیه برای هر کاربر است</b>',
+                parse_mode="HTML"
+            )
+            return
+        
+        user_cooldowns[user_id] = current_time
+        
         target_message = message.reply_to_message if message.reply_to_message else message
         await process_gift_link(link, target_message, context.bot.username)
-    else:
-        await message.reply_text(
-            "Please provide a Telegram Gift link.\n\n"
-            "<b>Usage:</b>\n"
-            "1. Send the command with a link:\n"
-            "   <code>/p https://t.me/nft/...</code>\n\n"
-            "2. Or, reply to a message that contains a link with just the command:\n"
-            "   <code>/p</code>",
-            parse_mode="HTML",
-        )
 
 
 async def send_welcome_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -288,7 +296,9 @@ def main() -> None:
     )
 
     app.add_handler(CommandHandler(["start", "help"], send_welcome_message))
-    app.add_handler(CommandHandler(["p", "price"], price_command_handler))
+    
+    # حساسیت فقط به + درون متن یا ارسال فقط حرف p
+    app.add_handler(MessageHandler(filters.Regex(re.compile(r'\+|(?i)^p$')), price_command_handler))
 
     log.info("Bot is now running. Press Ctrl+C to stop.")
     app.run_polling()
